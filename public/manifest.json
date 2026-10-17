@@ -1,0 +1,32 @@
+{
+  "manifest_version": 3,
+  "name": "UCloud Check",
+  "version": "1.0.0",
+  "description": "UCloud 快捷签到插件",
+  "action": {
+    "default_title": "UCloud Check",
+    "default_popup": "index.html"
+  },
+  "options_page": "options.html",
+  "host_permissions": [
+    "https://ucloud.bupt.edu.cn/*"
+  ],
+  "permissions": [
+    "cookies",
+    "storage",
+    "clipboardRead",
+    "clipboardWrite"
+  ],
+  "content_scripts": [
+    {
+      "matches": [
+        "https://ucloud.bupt.edu.cn/*",
+        "https://apiucloud.bupt.edu.cn/*"
+      ],
+      "js": [
+        "assets/content.js"
+      ],
+      "run_at": "document_end"
+    }
+  ]
+}
