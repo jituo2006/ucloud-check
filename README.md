@@ -1,6 +1,3 @@
-# UCloud Check
-
-~~BYR签到~~
 
 ## 功能
 
