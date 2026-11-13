@@ -6,7 +6,22 @@ import tseslint from 'typescript-eslint'
 import { defineConfig, globalIgnores } from 'eslint/config'
 
 export default defineConfig([
-  globalIgnores(['dist']),
+  globalIgnores(['dist', '.wrangler', 'cloudflare/.wrangler']),
+  {
+    files: ['cloudflare/worker.mjs', 'cloudflare/session.mjs', 'cloudflare/schedule.mjs', 'cloudflare/timetable.mjs', 'cloudflare/attendance-probe.mjs', 'cloudflare/plugin-signing.mjs'],
+    ...js.configs.recommended,
+    languageOptions: { globals: globals.browser },
+  },
+  {
+    files: ['public/background.js', 'public/monitor/**/*.js', 'relay/web/*.js'],
+    ...js.configs.recommended,
+    languageOptions: { globals: { ...globals.browser, chrome: 'readonly' } },
+  },
+  {
+    files: ['relay/*.mjs', 'tests/*.mjs', 'cloudflare/init.mjs', 'cloudflare/test-bark.mjs', 'cloudflare/import-timetable.mjs'],
+    ...js.configs.recommended,
+    languageOptions: { globals: globals.node },
+  },
   {
     files: ['**/*.{ts,tsx}'],
     extends: [

@@ -2,6 +2,8 @@
   "manifest_version": 3,
   "name": "UCloud Check",
   "version": "1.0.0",
+  "minimum_chrome_version": "120",
+  "background": { "service_worker": "background.js", "type": "module" },
   "description": "UCloud 快捷签到插件",
   "action": {
     "default_title": "UCloud Check",
@@ -9,10 +11,13 @@
   },
   "options_page": "options.html",
   "host_permissions": [
-    "https://ucloud.bupt.edu.cn/*"
+    "https://ucloud.bupt.edu.cn/*",
+    "https://apiucloud.bupt.edu.cn/*"
   ],
+  "optional_host_permissions": ["https://*/*", "http://localhost/*", "http://127.0.0.1/*"],
   "permissions": [
     "cookies",
+    "alarms",
     "storage",
     "clipboardRead",
     "clipboardWrite"

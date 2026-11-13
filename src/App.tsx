@@ -251,26 +251,23 @@ function App() {
     };
   }, []);
 
-  const autoSign = (siteId: string, groupId: string) => {
+  const autoSign = async (siteId: string, groupId: string) => {
     if (!info?.id) return;
-    getCheckoutBasic(siteId, groupId)
-      .then((r) => {
-        const attendanceId = r.data.data.attendanceBasicInfo.id;
-        if (attendanceId <= 0) {
-          Toast.error("未找到签到ID");
-          return;
-        }
-        getAttendanceEncryptionParam().then((r) => {
-          const clockV2 = r.data.data.data;
-          sign(attendanceId, siteId, info.id, groupId, clockV2).then(() => {
-            Toast.success("签到成功");
-          });
-        });
-      })
-      .catch((e) => {
-        console.log(e);
-        Toast.error(e.response.data.message);
-      });
+    try {
+      const r = await getCheckoutBasic(siteId, groupId);
+      const attendanceId = r.data.data.attendanceBasicInfo.id;
+      if (r.data.code !== 200 || !attendanceId || attendanceId <= 0) {
+        Toast.error("未找到有效签到信息");
+        return;
+      }
+      const clock = await getAttendanceEncryptionParam();
+      if (clock.data.code !== 200 || !clock.data.data?.data) throw new Error("未取得动态参数");
+      const response = await sign(attendanceId, siteId, info.id, groupId, clock.data.data.data);
+      if (response.data.code !== 200) throw new Error("平台未接受签到请求");
+      Toast.success("平台已接受签到请求，请查看签到记录");
+    } catch {
+      Toast.error("签到未确认，请查看云邮记录；请勿盲目重复提交");
+    }
   };
 
   return (
