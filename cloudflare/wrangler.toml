@@ -1,3 +1,4 @@
+# Public template. Personal deployment settings belong in ignored wrangler.local.toml.
 name = "ucloud-check"
 main = "worker.mjs"
 compatibility_date = "2026-11-06"
@@ -15,21 +16,21 @@ run_worker_first = true
 [[d1_databases]]
 binding = "DB"
 database_name = "ucloud-check"
-database_id = "f18e47d1-df29-4515-9545-e1042a7f4c86"
+database_id = "00000000-0000-0000-0000-000000000000"
 migrations_dir = "migrations"
 
 [triggers]
 crons = ["* * * * *"]
 
 [vars]
-ENABLED = "true"
-ENABLE_SIGNING = "true"
-ENABLE_ATTENDANCE_MONITOR = "true"
+ENABLED = "false"
+ENABLE_SIGNING = "false"
+ENABLE_ATTENDANCE_MONITOR = "false"
 ENABLE_ATTENDANCE_PROBE = "false"
-AUTO_SIGN = "true"
+AUTO_SIGN = "false"
 SIGNING_PROTOCOL = "plugin"
 UCLOUD_CLIENT_ID = "portal"
-PUBLIC_BASE_URL = "https://ucloud-check.studyhub-lab-7c42.workers.dev"
+PUBLIC_BASE_URL = "https://your-worker.your-subdomain.workers.dev"
 OPEN_STATUSES = ""
 UNSIGNED_PATH = ""
 UNSIGNED_VALUES = ""

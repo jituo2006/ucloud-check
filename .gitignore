@@ -35,3 +35,9 @@ relay/data/
 cloudflare/timetable.local.json
 .dev.vars.*
 !.dev.vars.example
+
+# Private working notes and deployment configuration
+docs/
+cloudflare/wrangler.local.toml
+*.har
+.security-audit/

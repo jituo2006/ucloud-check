@@ -17,8 +17,8 @@ test('requires calibrated status and a valid, current, matching attendance windo
   assert.throws(() => activeAttendance({ attendanceBasicInfo: { ...basic.attendanceBasicInfo, attendanceEndTime: '' } }, course, ['1'], now), /有效期/);
 });
 test('preserves long identifiers; separates attendance rounds; rejects false business success', () => {
-  assert.equal(id('1823312437742391339'), '1823312437742391339');
-  assert.throws(() => id(Number('1823312437742391339')), /精度/);
+  assert.equal(id('1234567890123456789'), '1234567890123456789');
+  assert.throws(() => id(Number('1234567890123456789')), /精度/);
   assert.notEqual(eventKey({ ...course, kind: 'attendance', attendanceId: '30' }), eventKey({ ...course, kind: 'attendance', attendanceId: '31' }));
   assert.throws(() => unwrap({ code: 400, data: 'not accepted' }), /未确认/);
 });

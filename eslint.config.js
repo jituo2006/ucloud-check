@@ -18,7 +18,7 @@ export default defineConfig([
     languageOptions: { globals: { ...globals.browser, chrome: 'readonly' } },
   },
   {
-    files: ['relay/*.mjs', 'tests/*.mjs', 'cloudflare/init.mjs', 'cloudflare/test-bark.mjs', 'cloudflare/import-timetable.mjs'],
+    files: ['relay/*.mjs', 'tests/*.mjs', 'scripts/*.mjs', 'cloudflare/init.mjs', 'cloudflare/test-bark.mjs', 'cloudflare/import-timetable.mjs', 'cloudflare/config.mjs', 'cloudflare/wrangler-command.mjs'],
     ...js.configs.recommended,
     languageOptions: { globals: globals.node },
   },
