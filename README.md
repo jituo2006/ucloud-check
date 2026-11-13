@@ -1,6 +1,6 @@
 # UCloud Check
 
-云邮 Chrome 扩展与 Cloudflare Workers 服务，支持课表驱动的课堂监测、Bark 提醒、会话续期及可选签到处理。
+云邮 Chrome 扩展与 Cloudflare Workers 服务，支持监测、Bark 提醒、会话续期。
 
 ## 目录
 
@@ -22,7 +22,7 @@ pnpm build
 在 Chrome 扩展管理页加载构建后的 `dist/`。
 
 ## 云端配置
-
+~~这些均为ai生成，个性化配置还是具体根据自己的agent为妙~~
 1. 将 `cloudflare/wrangler.toml` 复制为 `cloudflare/wrangler.local.toml`，填写自己的 D1 数据库 ID、服务地址和功能开关。
 2. 运行 `pnpm cf:init` 生成本地 `.dev.vars`，填写自己的 Bark 配置和同次登录的云邮访问/刷新令牌。
 3. 创建 D1 并应用 `cloudflare/migrations/0001.sql`。本地配置和线上 Secrets 分开管理；部署前需将所需 Secrets 上传到自己的 Worker。
