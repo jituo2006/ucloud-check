@@ -1,0 +1,7 @@
+# Copy to cloudflare/.dev.vars for local use; do not paste real keys into chat.
+BARK_DEVICE_KEY=""
+UCLOUD_TOKEN=""
+UCLOUD_REFRESH_TOKEN=""
+SESSION_SECRET=""
+ADMIN_KEY=""
+CONFIRM_SECRET=""

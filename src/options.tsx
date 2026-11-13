@@ -2,6 +2,7 @@ import { StrictMode, useEffect, useMemo, useState } from "react";
 import { createRoot } from "react-dom/client";
 import "./index.css";
 import { Button, Input, Layout, Toast } from "@douyinfe/semi-ui";
+import { MonitoringSettings } from "./MonitoringSettings";
 
 const { Header, Content, Footer } = Layout;
 
@@ -204,6 +205,7 @@ function OptionsApp() {
         <div className="mt-2">
           <Button onClick={saveCredentials}>保存凭据</Button>
         </div>
+        <MonitoringSettings />
       </Content>
       <Footer style={{ minHeight: 48, lineHeight: "48px" }}>
         <div className="text-center text-xs text-gray-500">
