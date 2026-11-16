@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { monitoringDue } from '../cloudflare/schedule.mjs';
+import { monitoringDue, nextClassWake } from '../cloudflare/schedule.mjs';
 const at = time => Date.parse('2026-11-13T' + time + '+08:00');
 const env = { ENABLED: 'true' };
 test('daytime interval is 30 minutes in Beijing time; nights and disabled monitoring make no queries', () => {
@@ -31,4 +31,24 @@ test('dated classes start dense monitoring ten minutes before class; an active c
   assert.equal(monitoringDue(plan, at('09:40:00'), at('09:39:00'), 0), false);
   assert.equal(monitoringDue(env, at('10:01:00'), at('10:00:00'), at('10:02:00')), true);
   assert.equal(monitoringDue(env, at('10:01:30'), at('10:01:00'), at('10:02:00')), false);
+});
+test('platform wake jumps directly to the next dated class and respects daytime boundaries', () => {
+  const timetable = { windows: [{ start: '2026-11-13T08:00:00+08:00', end: '2026-11-13T09:40:00+08:00' },
+    { start: '2026-11-14T06:50:00+08:00', end: '2026-11-14T07:40:00+08:00' }] };
+  assert.equal(nextClassWake(env, at('00:00:00'), timetable), at('07:50:00'));
+  assert.equal(nextClassWake(env, at('07:50:00'), timetable), at('07:51:00'));
+  assert.equal(nextClassWake(env, at('09:40:00'), timetable), Date.parse('2026-11-14T07:00:00+08:00'));
+  assert.equal(nextClassWake({ ENABLED: 'false' }, at('08:00:00'), timetable), null);
+  assert.equal(nextClassWake(env, at('08:00:00'), { windows: [] }), null);
+  assert.equal(nextClassWake(env, at('20:59:00'), { windows: [] }, at('21:10:00')), null);
+  assert.equal(nextClassWake(env, at('10:00:10'), { windows: [] }, at('10:02:00')), at('10:01:00'));
+});
+test('class discovery runs every five minutes, switching to one minute only after an active class is detected', () => {
+  const timetable = { windows: [{ start: '2026-11-13T08:00:00+08:00', end: '2026-11-13T09:40:00+08:00' }] };
+  const plan = { ...env, CLASS_DISCOVERY_INTERVAL_MINUTES: '5', SCHEDULE_ONLY: 'true', CLASS_WINDOWS: JSON.stringify(timetable.windows) };
+  assert.equal(monitoringDue(plan, at('07:51:00'), at('07:50:00'), 0), false);
+  assert.equal(monitoringDue(plan, at('07:55:00'), at('07:50:00'), 0), true);
+  assert.equal(monitoringDue(plan, at('07:51:00'), at('07:50:00'), at('07:52:00')), true);
+  assert.equal(nextClassWake(plan, at('07:50:01'), timetable, 0, at('07:50:00')), at('07:55:00'));
+  assert.equal(nextClassWake(plan, at('07:50:01'), timetable, at('07:52:00'), at('07:50:00')), at('07:51:00'));
 });

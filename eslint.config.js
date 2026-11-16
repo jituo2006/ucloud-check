@@ -8,7 +8,7 @@ import { defineConfig, globalIgnores } from 'eslint/config'
 export default defineConfig([
   globalIgnores(['dist', '.wrangler', 'cloudflare/.wrangler']),
   {
-    files: ['cloudflare/worker.mjs', 'cloudflare/session.mjs', 'cloudflare/schedule.mjs', 'cloudflare/timetable.mjs', 'cloudflare/attendance-probe.mjs', 'cloudflare/plugin-signing.mjs'],
+    files: ['cloudflare/worker.mjs', 'cloudflare/entry.mjs', 'cloudflare/class-scheduler.mjs', 'cloudflare/cas-login.mjs', 'cloudflare/session.mjs', 'cloudflare/schedule.mjs', 'cloudflare/timetable.mjs', 'cloudflare/attendance-probe.mjs', 'cloudflare/plugin-signing.mjs'],
     ...js.configs.recommended,
     languageOptions: { globals: globals.browser },
   },

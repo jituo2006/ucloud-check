@@ -1,6 +1,6 @@
 # Public template. Personal deployment settings belong in ignored wrangler.local.toml.
 name = "ucloud-check"
-main = "worker.mjs"
+main = "entry.mjs"
 compatibility_date = "2026-11-06"
 workers_dev = true
 send_metrics = false
@@ -20,7 +20,15 @@ database_id = "00000000-0000-0000-0000-000000000000"
 migrations_dir = "migrations"
 
 [triggers]
-crons = ["* * * * *"]
+crons = ["*/30 * * * *"]
+
+[[durable_objects.bindings]]
+name = "CLASS_SCHEDULER"
+class_name = "ClassScheduler"
+
+[[migrations]]
+tag = "class-scheduler-v1"
+new_sqlite_classes = ["ClassScheduler"]
 
 [vars]
 ENABLED = "false"
@@ -37,6 +45,11 @@ UNSIGNED_VALUES = ""
 DAY_START_HOUR = "7"
 DAY_END_HOUR = "21"
 IDLE_INTERVAL_MINUTES = "30"
+SESSION_MAINTENANCE_24H = "false"
+SESSION_REFRESH_INTERVAL_MINUTES = "30"
+AUTO_REAUTH = "false"
+REAUTH_BEFORE_EXPIRY_MINUTES = "120"
 PRECLASS_MINUTES = "10"
+CLASS_DISCOVERY_INTERVAL_MINUTES = "1"
 # Exact dated windows with explicit +08:00 timezone, populated after verifying the timetable.
 CLASS_WINDOWS = "[]"

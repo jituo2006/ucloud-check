@@ -20,7 +20,7 @@ function fixture(t) {
   } };
   let time = Date.parse('2026-11-06T12:00:00Z');
   let mode = 'normal';
-  const calls = [], pushes = [], tasks = [];
+  const calls = [], pushes = [], tasks = [], casPasswords = [];
   const env = { DB, ENABLED: 'true', ENABLE_SIGNING: 'true', PUBLIC_BASE_URL: 'https://cloud.example',
     OPEN_STATUSES: '1', UNSIGNED_PATH: 'person.signed', UNSIGNED_VALUES: '0',
     ADMIN_KEY: 'admin'.repeat(10), CONFIRM_SECRET: 'sign'.repeat(12), BARK_DEVICE_KEY: 'offline-key', UCLOUD_TOKEN: 'offline-token',
@@ -33,11 +33,33 @@ function fixture(t) {
     assert.equal(options.redirect, 'manual', 'credentials must not follow redirects');
     const path = new URL(url).pathname;
     calls.push(path);
+    if (new URL(url).hostname === 'auth.bupt.edu.cn') {
+      const form = '<form id="loginForm"><input name="execution" value="offline-state"><input name="_eventId" value="submit"></form>';
+      if (options.method === 'POST') {
+        const fields = new URLSearchParams(options.body);
+        assert.equal(fields.get('username'), env.UCLOUD_CAS_USERNAME);
+        assert.equal(fields.get('password'), env.UCLOUD_CAS_PASSWORD);
+        casPasswords.push(time);
+        if (mode === 'cas-rejected') return new Response(form);
+        return new Response(null, { status: 302, headers: { Location: 'https://ucloud.bupt.edu.cn/?ticket=ST-offline-ticket-only', 'Set-Cookie': 'TGC=offline-sso-cookie; Path=/authserver; Secure; HttpOnly' } });
+      }
+      if (options.headers.Cookie?.includes('TGC=offline-sso-cookie')) return new Response(null, { status: 302, headers: { Location: 'https://ucloud.bupt.edu.cn/?ticket=ST-offline-ticket-only' } });
+      return new Response(form);
+    }
     if (path === '/ykt-basics/oauth/token') {
       if (env.UCLOUD_CLIENT_ID === 'portal') assert.equal(options.headers.Authorization, 'Basic cG9ydGFsOnBvcnRhbF9zZWNyZXQ=');
+      if (new URLSearchParams(options.body).get('grant_type') === 'third') {
+        if (mode === 'cas-exchange-down') return new Response('temporary unavailable', { status: 503 });
+        return Response.json({ access_token: jwt({ user_id: '9', exp: Math.floor(time / 1000) + 7200 }), refresh_token: jwt({ exp: Math.floor(time / 1000) + 72000 }), expires_in: 7200 });
+      }
       assert.equal(new URLSearchParams(options.body).get('grant_type'), 'refresh_token');
+      if (env.AUTO_REAUTH === 'true') return Response.json({ access_token: jwt({ user_id: '9', exp: Math.floor(time / 1000) + 7200 }), refresh_token: new URLSearchParams(options.body).get('refresh_token'), expires_in: 7200 });
       if (mode === 'refresh-denied') return Response.json({ error: 'invalid_grant' }, { status: 400 });
       if (mode === 'refresh-lost') throw new Error('lost refresh response');
+      if (mode === 'fixed-refresh-deadline') {
+        const exp = JSON.parse(Buffer.from(env.UCLOUD_REFRESH_TOKEN.split('.')[1], 'base64url')).exp;
+        return Response.json({ access_token: 'rotated-access', refresh_token: 'e30.' + Buffer.from(JSON.stringify({ exp, jti: 'rotated' })).toString('base64url') + '.signature', expires_in: 3600 });
+      }
       return Response.json({ access_token: 'rotated-access', refresh_token: 'rotated-refresh', expires_in: 3600 });
     }
     if (mode === 'redirect') return new Response(null, { status: 302, headers: { Location: 'https://other.example' } });
@@ -47,6 +69,9 @@ function fixture(t) {
       return Response.json({ code: 200 });
     }
     if (mode === 'expired-auth') return new Response('{}', { status: 401 });
+    if (mode === 'business-auth' && options.headers['Blade-Auth'] !== 'rotated-access') return Response.json({ code: 401, msg: 'private-server-echo' });
+    if (path === '/blade-chat/web/chat/myCourse' && mode === 'query-network') throw new Error('private-server-echo');
+    if (path === '/blade-chat/web/chat/myCourse' && mode === 'query-business') return Response.json({ code: 503, msg: 'private-server-echo' });
     if (path === '/blade-chat/web/chat/myCourse' && mode === 'no-class-object') return Response.json({ code: 200, success: true, msg: '没有正在上课的课程', data: {} });
     if (path === '/blade-chat/web/chat/myCourse' && mode === 'unknown-object') return Response.json({ code: 200, data: {} });
     if (['refresh-auth', 'refresh-denied', 'refresh-lost'].includes(mode) && options.headers['Blade-Auth'] !== 'rotated-access') return new Response('{}', { status: 401 });
@@ -65,6 +90,7 @@ function fixture(t) {
       data = { totalCount: 1, signCount: 1, timeAndStatusList: [{ attendanceId: currentRecorded ? '30' : '99', status: 11, time: '2026-11-06 20:00:00', name: 'private-name' }] };
     }
     else if (path === '/ykt-site/attendancedetailinfo/sign') {
+      if (mode === 'sign-business-auth') return Response.json({ code: 401, msg: 'private-server-echo' });
       if (mode === 'sign-unauthorized') return new Response('{}', { status: 401 });
       if (mode === 'timeout') throw new Error('simulated timeout');
       if (mode === 'business-rejection') return Response.json({ code: 400 });
@@ -80,13 +106,114 @@ function fixture(t) {
     }), env, ctx);
     return { status: res.status, body: await res.json(), headers: res.headers };
   };
-  return { app, env, ctx, calls, pushes, request, sqlite,
+  return { app, env, ctx, calls, pushes, request, sqlite, casPasswords, now: () => time,
     mode: value => { mode = value; }, advance: value => { time += value; },
     drain: async () => { while (tasks.length) await Promise.all(tasks.splice(0)); },
     token: () => new URL(pushes.find(push => push.url).url).hash.slice(1),
     submissions: () => calls.filter(path => path.endsWith('/attendancedetailinfo/sign')).length,
   };
 }
+const jwt = claims => 'e30.' + Buffer.from(JSON.stringify(claims)).toString('base64url') + '.signature';
+function enableAutoReauth(f, refreshInMs = 3600000) {
+  Object.assign(f.env, { AUTO_REAUTH: 'true', UCLOUD_CLIENT_ID: 'portal', SESSION_MAINTENANCE_24H: 'true',
+    UCLOUD_CAS_USERNAME: 'offline-account', UCLOUD_CAS_PASSWORD: 'offline-password',
+    UCLOUD_TOKEN: jwt({ user_id: '9', exp: Math.floor(f.now() / 1000) + 7200 }),
+    UCLOUD_REFRESH_TOKEN: jwt({ exp: Math.floor((f.now() + refreshInMs) / 1000) }) });
+  f.sqlite.prepare('INSERT INTO state(key,value) VALUES (?,?)').run('timetable', JSON.stringify({ userId: '9', term: '2026-2027-1', windows: [] }));
+}
+
+test('near-expiry maintenance obtains a fresh CAS session and encrypted SSO cookies, then renews across the next day without another password post', async t => {
+  const f = fixture(t); enableAutoReauth(f);
+  await f.app.monitor(f.env, { scheduled: true });
+  let s = (await f.request('/api/admin/status', {}, true)).body;
+  assert.equal(s.loginHealth.ok, true); assert.equal(s.sessionHealth.blocked, false);
+  assert.equal(s.sessionHealth.refreshDeadlineExtended, true); assert.equal(f.casPasswords.length, 1);
+  const first = s.sessionHealth.refreshExpiresAt;
+  const stored = f.sqlite.prepare("SELECT value FROM state WHERE key='session'").get().value;
+  for (const secret of ['offline-sso-cookie', f.env.UCLOUD_CAS_PASSWORD, 'ST-offline-ticket-only']) assert.equal(stored.includes(secret), false);
+  // A normal half-hour access refresh must retain the encrypted SSO session.
+  f.advance(30 * 60000); await f.app.monitor(f.env, { scheduled: true });
+  f.advance(18 * 3600000); await f.app.monitor(f.env, { scheduled: true });
+  s = (await f.request('/api/admin/status', {}, true)).body;
+  assert.ok(s.sessionHealth.refreshExpiresAt > first);
+  assert.equal(s.sessionHealth.reauthFailure, null); assert.equal(f.casPasswords.length, 1);
+  assert.equal(f.submissions(), 0);
+});
+test('expired refresh recovers via normal login while rejected credentials preserve a usable session and stop password retries until changed', async t => {
+  const expired = fixture(t); enableAutoReauth(expired, -1000);
+  await expired.app.monitor(expired.env, { scheduled: true });
+  assert.equal((await expired.request('/api/admin/status', {}, true)).body.loginHealth.ok, true);
+  assert.equal(expired.casPasswords.length, 1);
+  const f = fixture(t); enableAutoReauth(f); f.mode('cas-rejected');
+  await f.app.monitor(f.env, { scheduled: true });
+  let health = (await f.request('/api/admin/status', {}, true)).body.sessionHealth;
+  assert.equal(health.blocked, false); assert.equal(health.reauthBlocked, true); assert.equal(health.reauthFailure, 'rejected');
+  f.advance(30 * 60000); await f.app.monitor(f.env, { scheduled: true });
+  assert.equal(f.casPasswords.length, 1);
+  f.env.UCLOUD_CAS_PASSWORD = 'offline-corrected-password'; f.mode('normal');
+  f.advance(30 * 60000); await f.app.monitor(f.env, { scheduled: true });
+  health = (await f.request('/api/admin/status', {}, true)).body.sessionHealth;
+  assert.equal(f.casPasswords.length, 2); assert.equal(health.reauthFailure, null); assert.equal(health.reauthBlocked, false);
+});
+test('authenticated re-login verifies identity and serializes concurrent password attempts without submitting attendance', async t => {
+  const f = fixture(t); enableAutoReauth(f);
+  assert.equal((await f.request('/api/admin/reauthenticate', {}, false)).status, 401);
+  const results = await Promise.all([f.request('/api/admin/reauthenticate', {}, true), f.request('/api/admin/reauthenticate', {}, true)]);
+  assert.deepEqual(results.map(item => item.status).sort(), [200, 401]);
+  assert.equal(f.casPasswords.length, 1); assert.equal(f.submissions(), 0);
+});
+test('a temporary token exchange failure is not treated as a bad password and recovers on a later maintenance tick', async t => {
+  const f = fixture(t); enableAutoReauth(f); f.mode('cas-exchange-down');
+  await f.app.monitor(f.env, { scheduled: true });
+  let h = (await f.request('/api/admin/status', {}, true)).body.sessionHealth;
+  assert.equal(h.reauthBlocked, false); assert.equal(h.reauthFailure, 'exchange_unavailable');
+  assert.equal(h.reauthFailureDetails.httpStatus, 503); assert.equal(h.reauthFailureDetails.stage, 'oauth_exchange');
+  f.advance(10 * 60000); await f.app.monitor(f.env, { scheduled: true });
+  assert.equal(f.casPasswords.length, 1);
+  f.advance(20 * 60000); f.mode('normal'); await f.app.monitor(f.env, { scheduled: true });
+  h = (await f.request('/api/admin/status', {}, true)).body.sessionHealth;
+  assert.equal(h.reauthBlocked, false); assert.equal(h.reauthFailure, null); assert.equal(f.casPasswords.length, 2);
+  assert.equal(f.submissions(), 0);
+});
+test('an expired refresh token does not discard a still valid access token while a temporary re-login failure waits for retry', async t => {
+  const f = fixture(t); enableAutoReauth(f, -1000); f.mode('cas-exchange-down');
+  await f.app.monitor(f.env, { scheduled: true });
+  const s = (await f.request('/api/admin/status', {}, true)).body;
+  assert.equal(s.loginHealth.ok, true); assert.equal(s.sessionHealth.refreshExpired, true);
+  assert.equal(s.sessionHealth.blocked, false); assert.equal(s.sessionHealth.reauthBlocked, false);
+  assert.ok(s.sessionHealth.accessExpiresAt > f.now()); assert.equal(f.submissions(), 0);
+});
+test('legacy exchange blocks are recoverable without replacing credentials or deleting encrypted state', async t => {
+  const f = fixture(t); enableAutoReauth(f); f.mode('cas-exchange-down');
+  await f.app.monitor(f.env, { scheduled: true });
+  const wrapper = JSON.parse(f.sqlite.prepare("SELECT value FROM state WHERE key='session'").get().value);
+  const key = await crypto.subtle.importKey('raw', await crypto.subtle.digest('SHA-256', new TextEncoder().encode(f.env.SESSION_SECRET)), 'AES-GCM', false, ['encrypt', 'decrypt']);
+  const additionalData = new TextEncoder().encode(wrapper.seed);
+  const plain = await crypto.subtle.decrypt({ name: 'AES-GCM', iv: Buffer.from(wrapper.iv, 'base64'), additionalData }, key, Buffer.from(wrapper.data, 'base64'));
+  const state = { ...JSON.parse(new TextDecoder().decode(plain)), reauthFailure: 'exchange', reauthBlocked: true };
+  const iv = crypto.getRandomValues(new Uint8Array(12));
+  const encrypted = await crypto.subtle.encrypt({ name: 'AES-GCM', iv, additionalData }, key, new TextEncoder().encode(JSON.stringify(state)));
+  f.sqlite.prepare("UPDATE state SET value=? WHERE key='session'").run(JSON.stringify({ seed: wrapper.seed, iv: Buffer.from(iv).toString('base64'), data: Buffer.from(encrypted).toString('base64') }));
+  f.advance(31 * 60000); f.mode('normal'); await f.app.monitor(f.env, { scheduled: true });
+  const h = (await f.request('/api/admin/status', {}, true)).body.sessionHealth;
+  assert.equal(h.reauthBlocked, false); assert.equal(h.reauthFailure, null); assert.equal(f.casPasswords.length, 2);
+});
+
+test('half-hour Cron arms class alarms even when authentication fails; planning never signs', async t => {
+  const f = fixture(t);
+  const plans = [];
+  f.env.SESSION_MAINTENANCE_24H = 'true';
+  f.env.CLASS_SCHEDULER = { getByName(name) { assert.equal(name, 'class-monitor'); return { fetch: async (url, options) => {
+    plans.push({ url, method: options.method }); return Response.json({ nextAt: 123 });
+  } }; } };
+  f.app.scheduled({}, f.env, f.ctx); await f.drain();
+  assert.equal(plans.length, 1);
+  assert.equal(f.calls.filter(path => path !== '/push').length, 0);
+  assert.equal((await f.request('/api/admin/scheduler-sync', {}, false)).status, 401);
+  assert.equal((await f.request('/api/admin/scheduler-sync', {}, true)).body.scheduler.nextAt, 123);
+  assert.equal(plans.length, 2);
+  assert.equal(f.submissions(), 0);
+});
 
 test('cloud redirects are rejected for both Bark and platform requests', async t => {
   const f = fixture(t);
@@ -194,6 +321,49 @@ test('refresh rotates both tokens, persists encrypted state, and reuses it acros
   f.env.UCLOUD_REFRESH_TOKEN = 'new-seed';
   await f.app.monitor(f.env);
   assert.equal(f.calls.filter(p => p === '/ykt-basics/oauth/token').length, 2);
+});
+test('HTTP-200 authentication failures refresh a read once, while a sign write is never replayed', async t => {
+  const f = fixture(t); f.env.UCLOUD_REFRESH_TOKEN = 'seed-refresh'; f.mode('business-auth');
+  await f.app.monitor(f.env);
+  assert.equal((await f.request('/api/admin/status', {}, true)).body.status.ok, true);
+  assert.equal(f.calls.filter(path => path === '/ykt-basics/oauth/token').length, 1);
+  const token = f.token(); f.mode('sign-business-auth');
+  await f.request('/api/confirmation/confirm', { token }); await f.drain();
+  assert.equal(f.submissions(), 1);
+  assert.equal(f.calls.filter(path => path === '/ykt-basics/oauth/token').length, 1);
+  assert.equal((await f.request('/api/confirmation/view', { token })).body.outcome, 'unknown');
+});
+test('safe endpoint diagnostics survive recovery without retaining response bodies or raw exceptions', async t => {
+  for (const [mode, details] of [
+    ['query-network', { endpoint: '/blade-chat/web/chat/myCourse', reason: 'network' }],
+    ['query-business', { endpoint: '/blade-chat/web/chat/myCourse', httpStatus: 200, businessCode: 503 }],
+  ]) {
+    const f = fixture(t); f.mode(mode); await f.app.monitor(f.env);
+    let s = (await f.request('/api/admin/status', {}, true)).body;
+    assert.equal(s.status.ok, false); assert.deepEqual(s.lastFailure.details, details);
+    assert.equal(JSON.stringify(s).includes('private-server-echo'), false);
+    f.advance(60000); f.mode('no-class'); await f.app.monitor(f.env);
+    s = (await f.request('/api/admin/status', {}, true)).body;
+    assert.equal(s.status.ok, true); assert.deepEqual(s.lastFailure.details, details);
+    assert.equal(f.submissions(), 0);
+  }
+});
+test('a transient login warning promises automatic recovery and a verified recovery is notified only once', async t => {
+  const f = fixture(t); enableAutoReauth(f); f.mode('cas-exchange-down');
+  // Neither token can support a query, so the first maintenance cycle must report failure.
+  f.env.UCLOUD_TOKEN = jwt({ user_id: '9', exp: Math.floor(f.now() / 1000) - 1 });
+  f.env.UCLOUD_REFRESH_TOKEN = jwt({ exp: Math.floor(f.now() / 1000) - 1 });
+  await f.app.monitor(f.env, { scheduled: true });
+  let s = (await f.request('/api/admin/status', {}, true)).body;
+  assert.equal(s.loginHealth.ok, false); assert.equal(s.lastFailure.session.reauthFailure, 'exchange_unavailable');
+  assert.equal(f.pushes.at(-1).title, '云邮登录暂未恢复');
+  f.advance(31 * 60000); f.mode('no-class'); await f.app.monitor(f.env, { scheduled: true });
+  s = (await f.request('/api/admin/status', {}, true)).body;
+  assert.equal(s.loginHealth.ok, true); assert.equal(s.lastFailure.session.reauthFailure, 'exchange_unavailable');
+  assert.equal(f.pushes.filter(push => push.title === '云邮登录已恢复').length, 1);
+  await f.app.monitor(f.env);
+  assert.equal(f.pushes.filter(push => push.title === '云邮登录已恢复').length, 1);
+  assert.equal(f.submissions(), 0);
 });
 test('denied or unanswered refresh is blocked rather than replaying a possibly rotated token', async t => {
   for (const mode of ['refresh-denied', 'refresh-lost']) {
@@ -315,4 +485,38 @@ test('automatic mode skips an already recorded current activity', async t => {
   f.mode('already-recorded'); await f.app.monitor(f.env);
   assert.equal(f.submissions(), 0);
   assert.equal(f.sqlite.prepare("SELECT outcome FROM events WHERE kind='attendance'").get().outcome, 'already_signed');
+});
+test('24-hour maintenance forces refresh every thirty minutes at night without classroom or signing requests', async t => {
+  const f = fixture(t); f.env.UCLOUD_REFRESH_TOKEN = 'seed-refresh'; f.env.SESSION_MAINTENANCE_24H = 'true';
+  f.advance(3 * 3600000);
+  await f.app.monitor(f.env, { scheduled: true });
+  assert.deepEqual(f.calls, ['/ykt-basics/oauth/token', '/ykt-basics/info']);
+  f.advance(20 * 60000); await f.app.monitor(f.env, { scheduled: true });
+  assert.equal(f.calls.length, 2);
+  f.advance(10 * 60000); await f.app.monitor(f.env, { scheduled: true });
+  assert.equal(f.calls.filter(p => p === '/ykt-basics/oauth/token').length, 2);
+  assert.equal(f.submissions(), 0);
+});
+test('an expired refresh token is diagnosed locally and never sent repeatedly to the platform', async t => {
+  const f = fixture(t); f.env.SESSION_MAINTENANCE_24H = 'true';
+  f.env.UCLOUD_REFRESH_TOKEN = 'e30.' + Buffer.from(JSON.stringify({ exp: 1 })).toString('base64url') + '.signature';
+  await f.app.monitor(f.env, { scheduled: true }); await f.app.monitor(f.env, { scheduled: true });
+  assert.equal(f.calls.includes('/ykt-basics/oauth/token'), false);
+  const health = (await f.request('/api/admin/status', {}, true)).body.sessionHealth;
+  assert.equal(health.reason, 'refresh_expired'); assert.equal(health.refreshExpired, true);
+  assert.equal(health.blocked, true);
+});
+test('refresh success with an unchanged refresh deadline is visible and warned once without claiming permanent login', async t => {
+  const f = fixture(t); f.env.SESSION_MAINTENANCE_24H = 'true';
+  const exp = Date.parse('2026-11-06T13:00:00Z') / 1000;
+  f.env.UCLOUD_REFRESH_TOKEN = 'e30.' + Buffer.from(JSON.stringify({ exp })).toString('base64url') + '.signature';
+  f.mode('fixed-refresh-deadline'); await f.app.monitor(f.env, { scheduled: true });
+  const status = (await f.request('/api/admin/status', {}, true)).body;
+  assert.equal(status.sessionHealth.refreshDeadlineExtended, false);
+  assert.equal(status.sessionHealth.refreshExpiresAt, exp * 1000);
+  assert.equal(status.sessionMaintenance24h, true);
+  const warnings = () => f.pushes.filter(p => p.title === '云邮会话即将到期').length;
+  assert.equal(warnings(), 1);
+  f.advance(30 * 60000); await f.app.monitor(f.env, { scheduled: true });
+  assert.equal(warnings(), 1);
 });

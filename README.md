@@ -30,6 +30,12 @@ pnpm build
 
 公开模板默认关闭监测和提交。`ENABLE_ATTENDANCE_MONITOR` 控制签到检测，`ENABLE_SIGNING` 控制提交，`AUTO_SIGN` 控制自动执行；关闭自动执行时保留手机确认流程。`SIGNING_PROTOCOL=plugin` 使用原扩展协议。
 
+基础 Cron 每半小时触发；`SESSION_MAINTENANCE_24H=true` 启用全天登录续期。课表另由 SQLite Durable Object Alarm 保存下次唤醒时间：课前 `PRECLASS_MINUTES` 分钟开始，每 `CLASS_DISCOVERY_INTERVAL_MINUTES` 分钟检查，默认值为 1，即课前十分钟至下课每分钟检测课堂和签到，无需等待平台先报告课堂开启；课外停止密集唤醒。发布会创建所需的 Durable Object 绑定；导入课表时自动重排闹钟，也可通过已认证的 `POST /api/admin/scheduler-sync` 重排。定期刷新能否延长刷新令牌有效期取决于平台。
+
+固定期限的 refresh token 通过正常重新认证替换：在 Worker Secrets 中配置 `UCLOUD_CAS_USERNAME`、`UCLOUD_CAS_PASSWORD` 并启用 `AUTO_REAUTH=true`，默认提前 `REAUTH_BEFORE_EXPIRY_MINUTES=120` 分钟获取 CAS ticket 并换取新会话。SSO Cookie 和新令牌一并加密保存，优先复用 SSO；账号核对成功后才替换旧会话。SSO ticket 被拒绝时尝试一次全新正常登录；网络、令牌兑换或临时身份核验失败按维护周期退避，仍有效的 access token 继续使用。验证码、密码拒绝和账号不一致会停止自动尝试并通知本人。状态接口仅保留阶段、HTTP 状态和白名单错误码，不记录服务端原始错误描述。已认证的 `POST /api/admin/reauthenticate` 可显式重试一次，`{"freshLogin":true}` 可不复用 SSO 会话。
+
+`POST /api/admin/status` 的 `lastFailure` 保留恢复前最近一次故障的接口和脱敏错误码。登录暂时失败与需要本人验证使用不同提醒；后台核实登录恢复后补发一次 Bark 通知。只读请求的 HTTP 401 或业务码 401 可触发一次会话恢复，签到提交不重发。
+
 ```bash
 pnpm cf:dev               # 本地开发，Cron 需显式触发
 pnpm cf:db:local          # 仅应用本地 D1 迁移

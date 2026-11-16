@@ -1,12 +1,13 @@
 import { activeAttendance, confirmedUnsigned, eventKey, id, relayOrigin, unwrap } from '../public/monitor/core.js';
 import { createSession, SessionFailure, clientAuthorization } from './session.mjs';
 import { monitoringDue } from './schedule.mjs';
+import { syncClassAlarm } from './class-scheduler.mjs';
 import { summarizeAttendance } from './attendance-probe.mjs';
 import { pluginActivity, matchingRecord } from './plugin-signing.mjs';
 
 const API = 'https://apiucloud.bupt.edu.cn';
 const json = (data, status = 200) => Response.json(data, { status });
-class Failure extends Error { constructor(status, message) { super(message); this.status = status; } }
+class Failure extends Error { constructor(status, message, details = null) { super(message); this.status = status; this.details = details; } }
 const list = value => String(value || '').split(',').map(value => value.trim()).filter(Boolean);
 // Older installations used ENABLE_SIGNING for both stages; explicit monitoring overrides that fallback.
 const monitorsAttendance = env => env.ENABLE_ATTENDANCE_MONITOR === undefined ? env.ENABLE_SIGNING === 'true' : env.ENABLE_ATTENDANCE_MONITOR === 'true';
@@ -50,26 +51,41 @@ export function createApplication({ request = fetch, now = Date.now } = {}) {
     let token;
     try { token = await session.token(env); }
     catch (error) { throw new Failure(401, error instanceof SessionFailure ? error.message : '登录会话暂不可用'); }
-    const send = token => request(API + path, {
+    const endpoint = path.split('?')[0];
+    const send = async token => {
+      let response;
+      try { response = await request(API + path, {
       // Workers supports manual/follow only. Reject non-2xx below without forwarding credentials.
       method, redirect: 'manual', signal: AbortSignal.timeout(5000),
       headers: { 'Blade-Auth': token, Authorization: clientAuthorization(token, env.UCLOUD_CLIENT_ID), 'Tenant-Id': '000000',
         ...(env.UCLOUD_IDENTITY ? { identity: env.UCLOUD_IDENTITY } : {}),
         ...(data !== undefined ? { 'Content-Type': 'application/json' } : {}) },
       ...(data !== undefined ? { body: JSON.stringify(data) } : {}),
-    });
-    let response = await send(token);
+      }); } catch (error) {
+        throw new Failure(502, '云邮接口请求未完成', { endpoint, reason: ['TimeoutError', 'AbortError'].includes(error?.name) ? 'timeout' : 'network' });
+      }
+      let body;
+      if (response.ok) {
+        try { body = await response.json(); }
+        catch { throw new Failure(502, '云邮接口未返回有效数据', { endpoint, reason: 'invalid_json', httpStatus: response.status }); }
+      }
+      return { response, body };
+    };
+    let { response, body } = await send(token);
+    const unauthorized = () => response.status === 401 || response.ok && Number(body?.code) === 401;
     const readOnly = method === 'GET' || ['/blade-chat/web/chat/myCourse', '/ykt-site/attendancebasicinfo/basic', '/ykt-site/attendancedetailinfo/getUserAttendListBySiteIdAndUserId'].includes(path.split('?')[0]);
-    if (response.status === 401 && readOnly) {
-      await response.body?.cancel();
-      try { token = await session.refresh(env, token); }
+    if (unauthorized() && readOnly) {
+      if (!response.bodyUsed) await response.body?.cancel();
+      try { token = await session.recover(env, token); }
       catch (error) { throw new Failure(401, error instanceof SessionFailure ? error.message : '登录刷新暂不可用'); }
-      response = await send(token);
+      ({ response, body } = await send(token));
     }
-    if (response.status === 401) throw new Failure(401, '云邮登录已失效，请更新会话');
-    if (!response.ok) throw new Failure(502, '云邮暂不可访问');
-    const body = await response.json();
-    const value = unwrap(body);
+    const details = { endpoint, httpStatus: response.status, businessCode: Number.isSafeInteger(body?.code) ? body.code : null };
+    if (unauthorized()) throw new Failure(401, '云邮登录暂未恢复', details);
+    if (!response.ok) throw new Failure(502, '云邮暂不可访问', details);
+    let value;
+    try { value = unwrap(body); }
+    catch { throw new Failure(502, '平台未确认业务请求成功', details); }
     return envelope ? body : value;
   };
   const bark = async (env, payload) => {
@@ -80,6 +96,16 @@ export function createApplication({ request = fetch, now = Date.now } = {}) {
       body: JSON.stringify({ ...payload, device_key: env.BARK_DEVICE_KEY, group: 'ucloud-check' }),
     });
     if (!response.ok || (await response.json()).code !== 200) throw new Failure(502, 'Bark 未接受推送');
+  };
+  const loginHealthy = async env => {
+    await put(env, 'login-health', { ok: true, updatedAt: now() });
+    const alerted = await get(env, 'login-alert'), recovered = await get(env, 'login-recovered-at');
+    if (alerted && (!recovered || alerted > recovered)) {
+      try {
+        await bark(env, { title: '云邮登录已恢复', body: '后台已核实当前账号，将继续按课表检测课堂，无需手动更新令牌。' });
+        await put(env, 'login-recovered-at', now());
+      } catch { /* Delivery can retry on a later successful identity check. */ }
+    }
   };
   const courses = async (env, siteIds) => {
     const body = await api(env, '/blade-chat/web/chat/myCourse?siteIds=' + siteIds.join(','), 'POST', {}, true);
@@ -192,6 +218,39 @@ export function createApplication({ request = fetch, now = Date.now } = {}) {
     if (!lease.meta.changes) return;
     try {
       const timetable = await get(env, 'timetable');
+      if (scheduled && env.SESSION_MAINTENANCE_24H === 'true') {
+        const last = await get(env, 'last-forced-refresh');
+        const interval = Number(env.SESSION_REFRESH_INTERVAL_MINUTES || 30);
+        if (!Number.isInteger(interval) || interval < 5 || interval > 120) throw new Failure(503, '会话刷新间隔无效');
+        if (!last || Math.floor(now() / 60000) - Math.floor(last / 60000) >= interval) {
+          await put(env, 'last-forced-refresh', now());
+          try { await session.maintain(env, timetable?.userId); }
+          catch (error) { throw new Failure(401, error instanceof SessionFailure ? error.message : '会话刷新暂不可用'); }
+          const user = await api(env, '/ykt-basics/info');
+          if (timetable && id(user.id) !== timetable.userId) throw new Failure(409, '课表账号与当前会话不一致');
+          await put(env, 'last-session-check', now());
+          await loginHealthy(env);
+          const health = await session.health(env);
+          const deadline = health.refreshExpiresAt;
+          if (health.reauthFailure && health.reauthFailure !== 'inflight') {
+            const previousAlert = await get(env, 'reauth-alert');
+            if (!previousAlert || now() - previousAlert >= 3600000) {
+              try {
+                await bark(env, health.reauthBlocked
+                  ? { title: '云邮自动重登需要处理', body: '统一认证需要本人处理，请查看后台诊断并检查学校要求的验证。' }
+                  : { title: '云邮自动重登暂未成功', body: '现有登录仍可使用，后台将在后续维护周期重试，无需立即更新令牌。' });
+                await put(env, 'reauth-alert', now());
+              } catch { /* A reminder failure must not interrupt a usable login session. */ }
+            }
+          }
+          if ((!health.autoReauthEnabled || !health.reauthConfigured) && deadline && deadline > now() && deadline - now() <= 2 * 3600000 && await get(env, 'session-expiry-alert') !== deadline) {
+            try {
+              await bark(env, { title: '云邮会话即将到期', body: '刷新令牌将在两小时内到期，请重新登录后更新会话；定期刷新不保证延长其截止时间。' });
+              await put(env, 'session-expiry-alert', deadline);
+            } catch { /* A reminder failure must not interrupt a successfully renewed session. */ }
+          }
+        }
+      }
       const scheduleEnv = timetable ? { ...env, SCHEDULE_ONLY: 'true', CLASS_WINDOWS: JSON.stringify(timetable.windows) } : env;
       if (scheduled && !monitoringDue(scheduleEnv, now(), await get(env, 'last-monitor-attempt'), await get(env, 'active-until'))) {
         // With an imported timetable, off-class ticks maintain login only; no classroom scan.
@@ -199,7 +258,7 @@ export function createApplication({ request = fetch, now = Date.now } = {}) {
           await put(env, 'last-session-check', now());
           const user = await api(env, '/ykt-basics/info');
           if (id(user.id) !== timetable.userId) throw new Failure(409, '课表账号与当前会话不一致，请重新导入');
-          await put(env, 'login-health', { ok: true, updatedAt: now() });
+          await loginHealthy(env);
         }
         return;
       }
@@ -209,6 +268,7 @@ export function createApplication({ request = fetch, now = Date.now } = {}) {
       const user = await api(env, '/ykt-basics/info');
       const userId = id(user.id);
       if (timetable && userId !== timetable.userId) throw new Failure(409, '课表账号与当前会话不一致，请重新导入');
+      await loginHealthy(env);
       await put(env, 'last-session-check', now());
       const sites = await api(env, `/ykt-site/site/list/student/current?userId=${userId}&siteRoleCode=2&current=1&size=9999`);
       if (!Array.isArray(sites?.records)) throw new Failure(502, '课程响应尚未确认');
@@ -251,11 +311,22 @@ export function createApplication({ request = fetch, now = Date.now } = {}) {
       await update(env, 'DELETE FROM events WHERE expires_at<?', now() - 7 * 86400000);
       await put(env, 'status', { ok: true, updatedAt: now(), courseCount: names.size, activeClasses: going.length, attendanceCandidates, signingReady: Boolean(calibrated && env.ENABLE_SIGNING === 'true') });
     } catch (error) {
-      await put(env, 'status', { ok: false, updatedAt: now(), message: error instanceof Failure ? error.message : '监测暂不可用，未自动重试签到' });
+      const health = await session.health(env);
+      const failure = { ok: false, updatedAt: now(), message: error instanceof Failure ? error.message : '监测暂不可用，未自动重试签到',
+        httpStatus: error instanceof Failure ? error.status : null, details: error instanceof Failure ? error.details : null,
+        session: { reason: health.reason, reauthFailure: health.reauthFailure, reauthBlocked: health.reauthBlocked,
+          reauthFailureDetails: health.reauthFailureDetails, refreshHttpStatus: health.refreshHttpStatus, oauthError: health.oauthError } };
+      await put(env, 'status', failure);
+      // Keep the diagnostic after recovery; never store a response body, token, or raw error text.
+      await put(env, 'last-monitor-failure', failure);
       if (error instanceof Failure && error.status === 401) {
+        await put(env, 'login-health', { ok: false, updatedAt: now() });
         const last = await get(env, 'login-alert');
         if (!last || now() - last > 3600000) {
-          await bark(env, { title: '云邮登录需要更新', body: '课堂监测已暂停，请更新云端会话。' });
+          const automaticRetry = health.autoReauthEnabled && health.reauthConfigured && !health.reauthBlocked;
+          await bark(env, automaticRetry
+            ? { title: '云邮登录暂未恢复', body: '本轮课堂查询未完成，后台会继续自动恢复登录；恢复后会另行通知。' }
+            : { title: '云邮登录需要处理', body: '课堂监测暂时暂停，请检查后台诊断、统一认证凭据或学校要求的本人验证。' });
           await put(env, 'login-alert', now());
         }
       }
@@ -287,6 +358,11 @@ export function createApplication({ request = fetch, now = Date.now } = {}) {
           const probes = await get(env, 'attendance-probes');
           const recent = await env.DB.prepare("SELECT title,attendance_id,status,outcome,created_at,expires_at FROM events WHERE kind='attendance' ORDER BY created_at DESC LIMIT 5").all();
           return json({ enabled: env.ENABLED === 'true', status: await get(env, 'status'), loginHealth: await get(env, 'login-health'),
+            lastFailure: await get(env, 'last-monitor-failure'), loginRecoveredAt: await get(env, 'login-recovered-at'),
+            sessionHealth: await session.health(env), sessionMaintenance24h: env.SESSION_MAINTENANCE_24H === 'true',
+            sessionRefreshIntervalMinutes: Number(env.SESSION_REFRESH_INTERVAL_MINUTES || 30),
+            classDiscoveryIntervalMinutes: Number(env.CLASS_DISCOVERY_INTERVAL_MINUTES || 1),
+            scheduler: await get(env, 'class-alarm'),
             recentAttendance: recent.results,
             attendanceMonitoringEnabled: monitorsAttendance(env), submissionEnabled: env.ENABLED === 'true' && env.ENABLE_SIGNING === 'true',
             automaticSigningEnabled: env.AUTO_SIGN === 'true' && env.ENABLE_SIGNING === 'true', signingProtocol: env.SIGNING_PROTOCOL || 'calibrated',
@@ -307,7 +383,20 @@ export function createApplication({ request = fetch, now = Date.now } = {}) {
           }).sort((a, b) => Date.parse(a.start) - Date.parse(b.start));
           const user = await api(env, '/ykt-basics/info');
           await put(env, 'timetable', { userId: id(user.id), term: input.term, importedAt: now(), windows });
+          await syncClassAlarm(env);
           return json({ ok: true, term: input.term, count: windows.length });
+        }
+        if (path === '/api/admin/scheduler-sync') return json({ ok: true, scheduler: await syncClassAlarm(env) });
+        if (path === '/api/admin/reauthenticate') {
+          const timetable = await get(env, 'timetable');
+          const text = await req.text();
+          if (text.length > 2048) throw new Failure(413, '请求过大');
+          let input;
+          try { input = text ? JSON.parse(text) : {}; } catch { throw new Failure(400, 'JSON 无效'); }
+          try { await session.reauthenticate(env, timetable?.userId, { force: true, freshLogin: input?.freshLogin === true }); }
+          catch (error) { throw new Failure(401, error instanceof SessionFailure ? error.message : '统一认证未完成'); }
+          await put(env, 'login-health', { ok: true, updatedAt: now() });
+          return json({ ok: true, identityMatches: true, sessionHealth: await session.health(env) });
         }
         if (path === '/api/admin/refresh-session') {
           const before = await api(env, '/ykt-basics/info');
@@ -365,7 +454,12 @@ export function createApplication({ request = fetch, now = Date.now } = {}) {
         'X-Content-Type-Options': 'nosniff', 'Content-Security-Policy': "default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'" })) response.headers.set(name, value);
       return response;
     },
-    scheduled(_controller, env, ctx) { ctx.waitUntil(monitor(env, { scheduled: true })); },
+    scheduled(_controller, env, ctx) {
+      ctx.waitUntil((async () => {
+        try { await monitor(env, { scheduled: true }); }
+        finally { await syncClassAlarm(env); }
+      })());
+    },
   };
 }
 
