@@ -5,6 +5,8 @@ import { id, serverTime } from '../public/monitor/core.js';
 export function pluginActivity(data, course, now) {
   const basic = data?.attendanceBasicInfo;
   if (!basic || basic.id === undefined || basic.id === null || String(basic.id) === '0') return null;
+  // Verified live: a closed activity returns id=-1 with empty start/end times.
+  if (typeof basic.id === 'number' && basic.id < 0 || typeof basic.id === 'string' && /^-\d+$/.test(basic.id)) return null;
   const attendanceId = id(basic.id), siteId = id(course.siteId), groupId = id(course.groupId);
   if (basic.siteId !== undefined && id(basic.siteId) !== siteId) throw new Error('签到课程不一致');
   if (basic.classLessonId !== undefined && id(basic.classLessonId) !== groupId) throw new Error('签到课次不一致');

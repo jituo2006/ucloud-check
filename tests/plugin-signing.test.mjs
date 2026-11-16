@@ -7,6 +7,8 @@ test('original plugin positive-ID protocol works without invented state fields a
   const active = pluginActivity({ attendanceBasicInfo: { id: '30' } }, course, now);
   assert.equal(active.attendanceId, '30'); assert.equal(active.expiresAt, now + 300000);
   assert.equal(pluginActivity({ attendanceBasicInfo: { id: '0' } }, course, now), null);
+  assert.equal(pluginActivity({ attendanceBasicInfo: { id: -1, attendanceStartTime: '', attendanceEndTime: '' } }, course, now), null);
+  assert.equal(pluginActivity({ attendanceBasicInfo: { id: '-1' } }, course, now), null);
   assert.equal(pluginActivity({}, course, now), null);
   assert.equal(pluginActivity({ attendanceBasicInfo: { id: '30', attendanceEndTime: '2026-11-13 15:39:59' } }, course, now), null);
   assert.equal(pluginActivity({ attendanceBasicInfo: { id: '30', attendanceStartTime: '2026-11-13 15:41:00' } }, course, now), null);
