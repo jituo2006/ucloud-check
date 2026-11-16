@@ -25,7 +25,7 @@ pnpm build
 ~~这些均为ai生成，个性化配置还是具体根据自己的agent为妙~~
 1. 将 `cloudflare/wrangler.toml` 复制为 `cloudflare/wrangler.local.toml`，填写自己的 D1 数据库 ID、服务地址和功能开关。
 2. 运行 `pnpm cf:init` 生成本地 `.dev.vars`，填写自己的 Bark 配置和同次登录的云邮访问/刷新令牌。
-3. 创建 D1 并应用 `cloudflare/migrations/0001.sql`。本地配置和线上 Secrets 分开管理；部署前需将所需 Secrets 上传到自己的 Worker。
+3. 创建 D1 并应用 `cloudflare/migrations/` 中的全部迁移；更新旧服务时先应用新增迁移，再发布代码。本地配置和线上 Secrets 分开管理；部署前需将所需 Secrets 上传到自己的 Worker。
 4. 使用 `pnpm cf:check` 检查构建，`pnpm cf:deploy` 发布。命令优先读取被 Git 忽略的 `wrangler.local.toml`。
 
 公开模板默认关闭监测和提交。`ENABLE_ATTENDANCE_MONITOR` 控制签到检测，`ENABLE_SIGNING` 控制提交，`AUTO_SIGN` 控制自动执行；关闭自动执行时保留手机确认流程。`SIGNING_PROTOCOL=plugin` 使用原扩展协议。
@@ -35,6 +35,8 @@ pnpm build
 固定期限的 refresh token 通过正常重新认证替换：在 Worker Secrets 中配置 `UCLOUD_CAS_USERNAME`、`UCLOUD_CAS_PASSWORD` 并启用 `AUTO_REAUTH=true`，默认提前 `REAUTH_BEFORE_EXPIRY_MINUTES=120` 分钟获取 CAS ticket 并换取新会话。SSO Cookie 和新令牌一并加密保存，优先复用 SSO；账号核对成功后才替换旧会话。SSO ticket 被拒绝时尝试一次全新正常登录；网络、令牌兑换或临时身份核验失败按维护周期退避，仍有效的 access token 继续使用。验证码、密码拒绝和账号不一致会停止自动尝试并通知本人。状态接口仅保留阶段、HTTP 状态和白名单错误码，不记录服务端原始错误描述。已认证的 `POST /api/admin/reauthenticate` 可显式重试一次，`{"freshLogin":true}` 可不复用 SSO 会话。
 
 `POST /api/admin/status` 的 `lastFailure` 保留恢复前最近一次故障的接口和脱敏错误码。登录暂时失败与需要本人验证使用不同提醒；后台核实登录恢复后补发一次 Bark 通知。只读请求的 HTTP 401 或业务码 401 可触发一次会话恢复，签到提交不重发。
+
+原插件协议提交后立即查询学校到课记录；尚未核实时，每分钟只读复核，最多五次，并受十分钟总期限限制。核实同一活动的记录后更新为 `verified` 并补发 Bark 成功通知；`unknown` 显示为“提交结果待核验”。待复核任务存入 D1，课堂结束后仍由闹钟完成有限复核。已认证的 `POST /api/admin/reconcile-attendance` 可只读复核近期旧记录，不重新提交签到。
 
 ```bash
 pnpm cf:dev               # 本地开发，Cron 需显式触发

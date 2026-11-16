@@ -7,7 +7,7 @@ function fixture() {
   const state = new Map([['timetable', { windows: [{ start: '2026-11-13T08:00:00+08:00', end: '2026-11-13T09:40:00+08:00' }] }]]);
   let time = at('00:00:00'), alarm = null;
   const calls = [];
-  const env = { ENABLED: 'true', DB: { prepare() { return { bind(key, value) { return {
+  const env = { ENABLED: 'true', DB: { prepare(sql) { if (sql.includes('MIN(CASE')) return { first: async () => ({ next_at: state.get('verification-next') ?? null }) }; return { bind(key, value) { return {
     first: async () => state.has(key) ? { value: JSON.stringify(state.get(key)) } : null,
     run: async () => { state.set(key, JSON.parse(value)); },
   }; } }; } } };
@@ -57,4 +57,12 @@ test('persistent alarms switch from five-minute discovery to minute attendance c
   f.time('07:55:00'); await f.fire(); assert.equal(f.alarm(), at('07:56:00'));
   f.env.active = false;
   f.time('07:56:00'); await f.fire(); assert.equal(f.alarm(), at('08:01:00'));
+});
+test('pending record verification adds only a bounded follow-up alarm after classroom hours', async () => {
+  const f = fixture(); f.time('21:00:00');
+  f.state.set('verification-next', at('21:01:00'));
+  await f.scheduler.plan(); assert.equal(f.alarm(), at('21:01:00'));
+  f.time('21:01:00'); f.state.delete('verification-next');
+  await f.fire(); assert.equal(f.alarm(), null);
+  assert.equal(f.calls.length, 1);
 });

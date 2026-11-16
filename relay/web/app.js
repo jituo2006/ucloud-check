@@ -10,7 +10,7 @@ const descriptions = {
   expired: '本轮确认已过期，请在云邮中查看当前签到状态。',
   done: '本次确认已处理。', notice: '这是一条课堂提醒。',
 };
-const outcomes = { accepted: '平台已接受签到请求；可在云邮查看记录。', verified: '本轮签到请求及到课记录已核实。', already_signed: '本轮已有到课记录，未重复提交。', failed: '活动或会话校验未通过，未提交签到，请手动处理。', unknown: '结果未确认，请查看云邮记录。系统不会自动重试提交。' };
+const outcomes = { accepted: '请求已受理，等待后台记录核验。', verified: '签到成功，学校后台已核实本轮到课记录。', already_signed: '本轮已有到课记录，未重复提交。', failed: '活动或会话校验未通过，未提交签到，请手动处理。', unknown: '提交结果待核验，请以云邮后台记录为准。' };
 let timer;
 async function request(action) {
   const response = await fetch('/api/confirmation/' + action, {
@@ -40,8 +40,13 @@ function render(data) {
     document.querySelector('#description').textContent = '当前签到处理已暂停，请在云邮中手动处理。';
   }
   output.textContent = outcomes[data.outcome] || '';
+  if (data.outcome === 'verified' && data.recordStatus) output.textContent += ' 状态：' + ({ 11: '正常', 12: '迟到', 13: '早退' }[data.recordStatus] || '已核实');
+  if (data.verificationPending) output.textContent += ' 后台正在查询记录，请勿重复签到。';
+  else if (cloud && data.outcome === 'unknown') output.textContent = '尚未核实本轮签到记录，请在云邮中查看。';
+  if (data.outcome === 'accepted' && data.verificationState === 'unresolved') output.textContent = '请求已受理，但未能核实后台记录，请在云邮中查看。';
+  if (data.status === 'done') button.textContent = data.outcome === 'verified' ? '签到成功' : data.verificationPending ? '记录核验中' : '处理已结束';
   clearTimeout(timer);
-  if (!['done', 'expired', 'notice', 'uncertain'].includes(data.status)) timer = setTimeout(load, 4000);
+  if (data.verificationPending || !['done', 'expired', 'notice', 'uncertain'].includes(data.status)) timer = setTimeout(load, data.verificationPending ? 15000 : 4000);
 }
 async function load() {
   try { render(await request('view')); }

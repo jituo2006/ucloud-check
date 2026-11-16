@@ -4,6 +4,7 @@ import { monitoringDue } from './schedule.mjs';
 import { syncClassAlarm } from './class-scheduler.mjs';
 import { summarizeAttendance } from './attendance-probe.mjs';
 import { pluginActivity, matchingRecord } from './plugin-signing.mjs';
+import { createAttendanceVerifier } from './attendance-verification.mjs';
 
 const API = 'https://apiucloud.bupt.edu.cn';
 const json = (data, status = 200) => Response.json(data, { status });
@@ -121,22 +122,36 @@ export function createApplication({ request = fetch, now = Date.now } = {}) {
     const activity = activeAttendance(data, course, list(env.OPEN_STATUSES), now());
     return activity && confirmedUnsigned(data, env.UNSIGNED_PATH, list(env.UNSIGNED_VALUES)) ? activity : null;
   };
+  const verifier = createAttendanceVerifier({ now,
+    readIdentity: async env => id((await api(env, '/ykt-basics/info')).id),
+    readBasic: async (env, event) => (await api(env, '/ykt-site/attendancebasicinfo/basic', 'POST', { siteId: event.site_id, groupId: event.group_id }))?.attendanceBasicInfo,
+    readRecords: (env, event) => api(env, '/ykt-site/attendancedetailinfo/getUserAttendListBySiteIdAndUserId', 'POST',
+      { siteId: event.site_id, userId: event.user_id, current: 1, size: 10 }),
+  });
   const notify = async (env, event, result = false) => {
     const field = result ? 'result_notified' : 'notified';
     const timeField = result ? 'result_notify_at' : 'notify_at';
-    const claimed = await update(env, `UPDATE events SET ${field}=2,${timeField}=? WHERE id=? AND (${field}=0 OR (${field}=2 AND ${timeField}<?))`, now(), event.id, now() - 60000);
+    const outcomeClause = result ? ' AND outcome=?' : '';
+    const claimed = await update(env, `UPDATE events SET ${field}=2,${timeField}=? WHERE id=? AND (${field}=0 OR (${field}=2 AND ${timeField}<?))${outcomeClause}`,
+      now(), event.id, now() - 60000, ...(result ? [event.outcome] : []));
     if (!claimed.meta.changes) return;
     try {
-      const descriptions = { accepted: '平台已接受本次签到请求，可在云邮查看记录。', verified: '请求已提交，且本轮到课记录已核实。', already_signed: '本轮已有到课或请假记录，未重复提交。', failed: '活动已变化、已完成或会话校验未通过，请手动处理。', unknown: '结果未确认，请查看云邮记录；不会自动重试提交。' };
+      const verification = result ? await verifier.job(env, event.id) : null;
+      const recordLabel = { 11: '正常', 12: '迟到', 13: '早退' }[verification?.record_status];
+      const descriptions = { accepted: '请求已受理，等待后台记录核验。', verified: '学校后台已核实本轮到课记录' + (recordLabel ? `（${recordLabel}）` : '') + '。',
+        already_signed: '本轮已有到课或请假记录，未重复提交。', failed: '活动已变化、已完成或会话校验未通过，请手动处理。',
+        unknown: verification?.state === 'pending' ? '提交结果待核验，后台将继续查询本轮记录。请勿重复签到。' : '尚未核实本轮签到记录，请在云邮中查看。' };
+      if (event.outcome === 'accepted' && verification?.state === 'unresolved') descriptions.accepted = '请求已受理，但未能核实后台记录，请在云邮中查看。';
       const automatic = env.AUTO_SIGN === 'true' && env.ENABLE_SIGNING === 'true';
-      const payload = result ? { title: event.title + ' · 签到处理结果', body: descriptions[event.outcome] } :
+      const resultTitle = { verified: '签到成功，后台已核实', accepted: '请求已受理', unknown: verification?.state === 'pending' ? '提交结果待核验' : '签到记录待查看' }[event.outcome] || '签到处理结果';
+      const payload = result ? { title: event.title + ' · ' + resultTitle, body: descriptions[event.outcome] } :
         { title: event.title + (event.kind === 'attendance' ? ' · 签到已开启' : ' · 课堂已开启'),
           body: event.kind === 'attendance' ? (automatic ? '检测到签到活动，云端正在自动处理。' : '点击查看本轮活动，由你确认后提交。') : '检测到进行中的课堂。' };
       if (!result && event.kind === 'attendance' && !automatic) payload.url = relayOrigin(env.PUBLIC_BASE_URL) + '/confirm#' + await tokenFor(env, event);
       await bark(env, payload);
-      await update(env, `UPDATE events SET ${field}=1 WHERE id=?`, event.id);
+      await update(env, `UPDATE events SET ${field}=1 WHERE id=?${outcomeClause}`, event.id, ...(result ? [event.outcome] : []));
     } catch (error) {
-      await update(env, `UPDATE events SET ${field}=0 WHERE id=?`, event.id);
+      await update(env, `UPDATE events SET ${field}=0 WHERE id=?${outcomeClause}`, event.id, ...(result ? [event.outcome] : []));
       throw error;
     }
   };
@@ -165,11 +180,13 @@ export function createApplication({ request = fetch, now = Date.now } = {}) {
   const view = async (env, eventId) => {
     await expire(env);
     const event = await getEvent(env, eventId);
+    const verification = await verifier.job(env, event.id);
     return { title: event.title, kind: event.kind, expiresAt: event.expires_at, status: event.status, outcome: event.outcome,
+      verificationPending: verification?.state === 'pending', verificationState: verification?.state ?? null, recordStatus: verification?.record_status ?? null,
       demo: false, executionHost: 'cloud', submissionEnabled: env.ENABLED === 'true' && env.ENABLE_SIGNING === 'true' &&
         protocolReady(env) };
   };
-  const execute = async (env, eventId) => {
+  const execute = async (env, eventId, { scheduleChecks = false } = {}) => {
     if (env.ENABLED !== 'true' || env.ENABLE_SIGNING !== 'true') return;
     const claimed = await update(env, "UPDATE events SET status='processing',claimed_at=? WHERE id=? AND status='confirmed' AND expires_at>?", now(), eventId, now());
     if (!claimed.meta.changes) return;
@@ -197,19 +214,45 @@ export function createApplication({ request = fetch, now = Date.now } = {}) {
       const clock = await api(env, '/ykt-site/common/v2/clock');
       if (typeof clock?.data !== 'string' || !clock.data) throw new Error('动态参数无效');
       if (event.expires_at <= now() || current.expiresAt <= now()) throw new Error('活动过期');
+      if (env.SIGNING_PROTOCOL === 'plugin') {
+        // Save the identity and exact activity start before the one permitted write.
+        await verifier.enqueue(env, event, current.startedAt);
+        if (scheduleChecks) { try { await syncClassAlarm(env); } catch { /* Existing alarms and Cron can also resume the check. */ } }
+      }
       outcome = 'unknown';
       await api(env, '/ykt-site/attendancedetailinfo/sign', 'POST', {
         attendanceDetailInfo: { attendanceId: current.attendanceId, siteId: course.siteId, userId: id(user.id), classLessonId: course.groupId },
         qrCodeCreateTime: clock.data,
       });
       outcome = 'accepted';
-      if (env.SIGNING_PROTOCOL === 'plugin') {
-        try { if ([11, 12, 13].includes(Number(matchingRecord(await readRecords(), current)?.status))) outcome = 'verified'; }
-        catch { /* Accepted remains distinct from an independently verified record. */ }
-      }
     } catch { /* An unanswered write is never retried or reported as successful. */ }
     await update(env, "UPDATE events SET status='done',outcome=? WHERE id=?", outcome, event.id);
-    await notify(env, { ...event, outcome }, true);
+    await verifier.verify(env, { ...event, status: 'done', outcome }, { immediate: true });
+    try { await notify(env, await getEvent(env, event.id), true); }
+    finally {
+      // Alarm callbacks already replan after monitor returns; awaiting the same DO here would deadlock.
+      if (scheduleChecks) { try { await syncClassAlarm(env); } catch { /* Cron retains access to the persisted check. */ } }
+    }
+  };
+  const reconcile = async (env, { includeLegacy = false } = {}) => {
+    if (env.ENABLED !== 'true' || env.SIGNING_PROTOCOL !== 'plugin') return { checked: 0, verified: 0 };
+    const legacy = includeLegacy ? (await env.DB.prepare(`SELECT e.* FROM events e LEFT JOIN attendance_verifications v ON v.event_id=e.id
+      WHERE e.kind='attendance' AND e.status='done' AND e.outcome IN ('unknown','accepted') AND e.created_at>? AND v.event_id IS NULL
+      ORDER BY e.created_at DESC LIMIT 3`).bind(now() - 7 * 86400000).all()).results : [];
+    const events = legacy.length ? legacy : await verifier.due(env);
+    let verified = 0;
+    for (const event of events) {
+      if (includeLegacy) await verifier.enqueue(env, event);
+      if (await verifier.verify(env, event, { immediate: includeLegacy })) verified++;
+    }
+    return { checked: events.length, verified };
+  };
+  const notifyResults = async env => {
+    const results = await env.DB.prepare("SELECT * FROM events WHERE status='done' AND result_notified<>1 LIMIT 3").all();
+    for (const event of results.results) {
+      try { await notify(env, event, true); }
+      catch { /* A push outage must not block login maintenance, verification, or classroom checks. */ }
+    }
   };
   const monitor = async (env, { scheduled = false } = {}) => {
     if (env.ENABLED !== 'true') return;
@@ -218,6 +261,9 @@ export function createApplication({ request = fetch, now = Date.now } = {}) {
     if (!lease.meta.changes) return;
     try {
       const timetable = await get(env, 'timetable');
+      await expire(env);
+      await reconcile(env);
+      await notifyResults(env);
       if (scheduled && env.SESSION_MAINTENANCE_24H === 'true') {
         const last = await get(env, 'last-forced-refresh');
         const interval = Number(env.SESSION_REFRESH_INTERVAL_MINUTES || 30);
@@ -264,7 +310,6 @@ export function createApplication({ request = fetch, now = Date.now } = {}) {
       }
       await put(env, 'last-monitor-attempt', now());
       relayOrigin(env.PUBLIC_BASE_URL);
-      await expire(env);
       const user = await api(env, '/ykt-basics/info');
       const userId = id(user.id);
       if (timetable && userId !== timetable.userId) throw new Failure(409, '课表账号与当前会话不一致，请重新导入');
@@ -306,8 +351,7 @@ export function createApplication({ request = fetch, now = Date.now } = {}) {
       await put(env, 'classroom-baseline', { userId, initialized: true, keys });
       const pending = await env.DB.prepare("SELECT id FROM events WHERE status='confirmed' AND expires_at>? LIMIT 1").bind(now()).all();
       for (const event of pending.results) await execute(env, event.id);
-      const results = await env.DB.prepare("SELECT * FROM events WHERE status='done' AND result_notified<>1 LIMIT 3").all();
-      for (const event of results.results) await notify(env, event, true);
+      await notifyResults(env);
       await update(env, 'DELETE FROM events WHERE expires_at<?', now() - 7 * 86400000);
       await put(env, 'status', { ok: true, updatedAt: now(), courseCount: names.size, activeClasses: going.length, attendanceCandidates, signingReady: Boolean(calibrated && env.ENABLE_SIGNING === 'true') });
     } catch (error) {
@@ -350,13 +394,16 @@ export function createApplication({ request = fetch, now = Date.now } = {}) {
       if (path.startsWith('/api/admin/')) {
         await admin(env, req);
         if (path === '/api/admin/test-bark') {
-          await bark(env, { title: '云邮提醒已连接', body: '这是一条测试通知，没有执行签到。' });
+          await bark(env, { title: '云邮提醒已连接', body: '这是一条测试通知。' });
           return json({ ok: true });
         }
         if (path === '/api/admin/status') {
           const timetable = await get(env, 'timetable');
           const probes = await get(env, 'attendance-probes');
-          const recent = await env.DB.prepare("SELECT title,attendance_id,status,outcome,created_at,expires_at FROM events WHERE kind='attendance' ORDER BY created_at DESC LIMIT 5").all();
+          const recent = await env.DB.prepare(`SELECT e.title,e.attendance_id,e.status,e.outcome,e.created_at,e.expires_at,
+            v.state AS verification_state,v.attempts AS verification_attempts,v.record_status,v.record_time
+            FROM events e LEFT JOIN attendance_verifications v ON v.event_id=e.id
+            WHERE e.kind='attendance' ORDER BY e.created_at DESC LIMIT 5`).all();
           return json({ enabled: env.ENABLED === 'true', status: await get(env, 'status'), loginHealth: await get(env, 'login-health'),
             lastFailure: await get(env, 'last-monitor-failure'), loginRecoveredAt: await get(env, 'login-recovered-at'),
             sessionHealth: await session.health(env), sessionMaintenance24h: env.SESSION_MAINTENANCE_24H === 'true',
@@ -406,7 +453,17 @@ export function createApplication({ request = fetch, now = Date.now } = {}) {
           if (id(before.id) !== id(after.id)) throw new Failure(409, '刷新前后账号不一致，请检查会话');
           return json({ ok: true, identityMatches: true });
         }
-        if (path === '/api/admin/monitor') { ctx.waitUntil(monitor(env)); return json({ queued: true }); }
+        if (path === '/api/admin/monitor') {
+          ctx.waitUntil((async () => { try { await monitor(env); } finally { await syncClassAlarm(env); } })());
+          return json({ queued: true });
+        }
+        if (path === '/api/admin/reconcile-attendance') {
+          await expire(env);
+          const result = await reconcile(env, { includeLegacy: true });
+          await notifyResults(env);
+          await syncClassAlarm(env);
+          return json({ ok: true, ...result });
+        }
         if (path === '/api/admin/attendance-records') {
           const text = await req.text();
           if (text.length > 2048) throw new Failure(413, '请求过大');
@@ -439,7 +496,7 @@ export function createApplication({ request = fetch, now = Date.now } = {}) {
         if (env.ENABLED !== 'true' || env.ENABLE_SIGNING !== 'true') throw new Failure(409, '当前未启用签到处理');
         if (event.kind !== 'attendance' || event.expires_at <= now()) throw new Failure(410, '本轮确认已过期或不适用');
         await update(env, "UPDATE events SET status='confirmed' WHERE id=? AND status='pending' AND expires_at>?", event.id, now());
-        ctx.waitUntil(execute(env, event.id));
+        ctx.waitUntil(execute(env, event.id, { scheduleChecks: true }));
       }
       return json(await view(env, event.id));
     } catch (error) {

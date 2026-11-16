@@ -1,4 +1,5 @@
 import { nextClassWake } from './schedule.mjs';
+import { nextVerificationWake } from './attendance-verification.mjs';
 
 export async function syncClassAlarm(env) {
   if (!env.CLASS_SCHEDULER) return null;
@@ -23,7 +24,10 @@ export function createClassScheduler({ storage, env, monitor, now = Date.now }) 
     const timetable = await read('timetable');
     const activeUntil = await read('active-until');
     const lastAttempt = await read('last-monitor-attempt');
-    const nextAt = nextClassWake(env, now(), timetable, activeUntil || 0, lastAttempt || 0);
+    const classAt = nextClassWake(env, now(), timetable, activeUntil || 0, lastAttempt || 0);
+    const verificationAt = await nextVerificationWake(env, now());
+    const candidates = [classAt, verificationAt].filter(Number.isFinite);
+    const nextAt = candidates.length ? Math.min(...candidates) : null;
     const previous = await storage.getAlarm();
     // A concurrent half-hour tick must not postpone an already due class alarm.
     if (nextAt === null) await storage.deleteAlarm();

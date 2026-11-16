@@ -3,10 +3,13 @@ import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { DatabaseSync } from 'node:sqlite';
 import { createApplication } from '../cloudflare/worker.mjs';
+import { nextVerificationWake } from '../cloudflare/attendance-verification.mjs';
+import { createClassScheduler } from '../cloudflare/class-scheduler.mjs';
 
 function fixture(t) {
   const sqlite = new DatabaseSync(':memory:');
   sqlite.exec(readFileSync(new URL('../cloudflare/migrations/0001.sql', import.meta.url), 'utf8'));
+  sqlite.exec(readFileSync(new URL('../cloudflare/migrations/0002_attendance_verification.sql', import.meta.url), 'utf8'));
   t.after(() => sqlite.close());
   const DB = { prepare(sql) {
     const statement = sqlite.prepare(sql);
@@ -20,6 +23,12 @@ function fixture(t) {
   } };
   let time = Date.parse('2026-11-06T12:00:00Z');
   let mode = 'normal';
+  let recordRows = null;
+  DB.batch = async statements => {
+    sqlite.exec('BEGIN');
+    try { const results = []; for (const statement of statements) results.push(await statement.run()); sqlite.exec('COMMIT'); return results; }
+    catch (error) { sqlite.exec('ROLLBACK'); throw error; }
+  };
   const calls = [], pushes = [], tasks = [], casPasswords = [];
   const env = { DB, ENABLED: 'true', ENABLE_SIGNING: 'true', PUBLIC_BASE_URL: 'https://cloud.example',
     OPEN_STATUSES: '1', UNSIGNED_PATH: 'person.signed', UNSIGNED_VALUES: '0',
@@ -86,13 +95,14 @@ function fixture(t) {
     else if (path === '/ykt-site/common/v2/clock') data = { data: 'offline-clock' };
     else if (path === '/ykt-site/attendancedetailinfo/getUserAttendListBySiteIdAndUserId') {
       assert.equal(JSON.parse(options.body).userId, '9');
-      const currentRecorded = mode === 'already-recorded' || calls.includes('/ykt-site/attendancedetailinfo/sign');
-      data = { totalCount: 1, signCount: 1, timeAndStatusList: [{ attendanceId: currentRecorded ? '30' : '99', status: 11, time: '2026-11-06 20:00:00', name: 'private-name' }] };
+      const currentRecorded = mode === 'already-recorded' || !['timeout', 'business-rejection', 'sign-unauthorized', 'sign-business-auth', 'delayed-record', 'lost-response-record'].includes(mode) && calls.includes('/ykt-site/attendancedetailinfo/sign') || mode === 'lost-response-record' && calls.includes('/ykt-site/attendancedetailinfo/sign');
+      data = { totalCount: 1, signCount: 1, timeAndStatusList: recordRows ?? [{ attendanceId: currentRecorded ? '30' : '99', status: 11, time: '2026-11-06 20:00:00', name: 'private-name' }] };
     }
     else if (path === '/ykt-site/attendancedetailinfo/sign') {
       if (mode === 'sign-business-auth') return Response.json({ code: 401, msg: 'private-server-echo' });
       if (mode === 'sign-unauthorized') return new Response('{}', { status: 401 });
       if (mode === 'timeout') throw new Error('simulated timeout');
+      if (mode === 'lost-response-record') throw new Error('response lost after school recorded attendance');
       if (mode === 'business-rejection') return Response.json({ code: 400 });
       data = {};
     } else throw new Error('Unexpected request');
@@ -108,6 +118,7 @@ function fixture(t) {
   };
   return { app, env, ctx, calls, pushes, request, sqlite, casPasswords, now: () => time,
     mode: value => { mode = value; }, advance: value => { time += value; },
+    records: value => { recordRows = value; },
     drain: async () => { while (tasks.length) await Promise.all(tasks.splice(0)); },
     token: () => new URL(pushes.find(push => push.url).url).hash.slice(1),
     submissions: () => calls.filter(path => path.endsWith('/attendancedetailinfo/sign')).length,
@@ -466,6 +477,116 @@ test('explicit automatic mode uses the original plugin protocol and submits once
   assert.equal(f.pushes.some(p => p.url), false);
   await f.app.monitor(f.env); assert.equal(f.submissions(), 1);
   assert.equal(f.sqlite.prepare("SELECT outcome FROM events WHERE kind='attendance'").get().outcome, 'verified');
+});
+test('a lost submission response is verified by school records without a second write', async t => {
+  const f = fixture(t); Object.assign(f.env, { AUTO_SIGN: 'true', SIGNING_PROTOCOL: 'plugin', ENABLE_ATTENDANCE_MONITOR: 'true' });
+  f.mode('lost-response-record'); await f.app.monitor(f.env); await f.app.monitor(f.env);
+  assert.equal(f.submissions(), 1);
+  const s = (await f.request('/api/admin/status', {}, true)).body;
+  assert.equal(s.recentAttendance[0].outcome, 'verified'); assert.equal(s.recentAttendance[0].record_status, 11);
+  assert.equal(f.pushes.filter(push => push.title.includes('后台已核实')).length, 1);
+  assert.equal(f.sqlite.prepare('SELECT attempts FROM attendance_verifications').get().attempts, 1);
+});
+test('delayed verification survives the end of monitoring hours and uses the saved exact start time', async t => {
+  const f = fixture(t); f.advance(59 * 60000);
+  Object.assign(f.env, { AUTO_SIGN: 'true', SIGNING_PROTOCOL: 'plugin', ENABLE_ATTENDANCE_MONITOR: 'true' });
+  f.mode('timeout'); await f.app.monitor(f.env);
+  assert.equal(f.sqlite.prepare("SELECT outcome FROM events WHERE kind='attendance'").get().outcome, 'unknown');
+  const calls = f.calls.length;
+  f.advance(60000); f.mode('no-class'); f.records([{ time: '2026-11-06 20:58:00', status: 11 }]);
+  await f.app.monitor(f.env, { scheduled: true });
+  assert.equal(f.submissions(), 1);
+  assert.equal(f.sqlite.prepare("SELECT outcome FROM events WHERE kind='attendance'").get().outcome, 'verified');
+  assert.deepEqual(f.calls.slice(calls), ['/ykt-basics/info', '/ykt-site/attendancedetailinfo/getUserAttendListBySiteIdAndUserId', '/push']);
+  assert.equal(f.pushes.filter(push => push.title.includes('提交结果待核验')).length, 1);
+  assert.equal(f.pushes.filter(push => push.title.includes('后台已核实')).length, 1);
+  await f.app.monitor(f.env, { scheduled: true });
+  assert.equal(f.pushes.filter(push => push.title.includes('后台已核实')).length, 1);
+});
+test('accepted writes with delayed records are also reconciled, while unrelated records exhaust five reads', async t => {
+  for (const mode of ['timeout', 'delayed-record']) {
+    const f = fixture(t); Object.assign(f.env, { AUTO_SIGN: 'true', SIGNING_PROTOCOL: 'plugin', ENABLE_ATTENDANCE_MONITOR: 'true' });
+    f.mode(mode); await f.app.monitor(f.env);
+    f.records([{ attendanceId: '99', time: '2026-11-06 19:59:00', status: 11 }]);
+    for (let i = 0; i < 6; i++) { f.advance(60000); await f.app.monitor(f.env); }
+    const row = f.sqlite.prepare('SELECT * FROM attendance_verifications').get();
+    assert.equal(row.attempts, 5); assert.equal(row.state, 'unresolved'); assert.equal(row.next_at, null);
+    assert.equal(f.sqlite.prepare("SELECT outcome FROM events WHERE kind='attendance'").get().outcome, mode === 'timeout' ? 'unknown' : 'accepted');
+    assert.equal(f.submissions(), 1);
+  }
+});
+test('a changed account cannot read another account records or verify its pending event', async t => {
+  const f = fixture(t); Object.assign(f.env, { AUTO_SIGN: 'true', SIGNING_PROTOCOL: 'plugin', ENABLE_ATTENDANCE_MONITOR: 'true' });
+  f.mode('timeout'); await f.app.monitor(f.env);
+  f.sqlite.prepare('INSERT INTO state(key,value) VALUES (?,?)').run('timetable', JSON.stringify({ userId: '9', windows: [] }));
+  const count = f.calls.filter(path => path.endsWith('getUserAttendListBySiteIdAndUserId')).length;
+  f.records([{ attendanceId: '30', status: 11 }]); f.mode('other-account'); f.advance(60000);
+  await f.app.monitor(f.env, { scheduled: true });
+  assert.equal(f.calls.filter(path => path.endsWith('getUserAttendListBySiteIdAndUserId')).length, count);
+  assert.equal(f.sqlite.prepare("SELECT outcome FROM events WHERE kind='attendance'").get().outcome, 'unknown');
+  assert.equal(f.submissions(), 1);
+});
+test('a persisted processing event resumes record verification after a restart without a new sign request', async t => {
+  const f = fixture(t); Object.assign(f.env, { AUTO_SIGN: 'true', SIGNING_PROTOCOL: 'plugin', ENABLE_ATTENDANCE_MONITOR: 'true' });
+  f.mode('timeout'); await f.app.monitor(f.env);
+  f.sqlite.prepare("UPDATE events SET status='processing',claimed_at=? WHERE kind='attendance'").run(f.now());
+  f.records([{ attendanceId: '30', status: 11 }]); f.advance(121000); f.mode('no-class');
+  await f.app.monitor(f.env, { scheduled: true });
+  assert.equal(f.sqlite.prepare("SELECT outcome FROM events WHERE kind='attendance'").get().outcome, 'verified');
+  assert.equal(f.submissions(), 1);
+});
+test('authenticated reconciliation backfills an old unknown event using only a matching activity and record', async t => {
+  const f = fixture(t); Object.assign(f.env, { AUTO_SIGN: 'true', SIGNING_PROTOCOL: 'plugin', ENABLE_ATTENDANCE_MONITOR: 'true' });
+  f.mode('timeout'); await f.app.monitor(f.env); f.sqlite.exec('DELETE FROM attendance_verifications');
+  f.records([{ time: '2026-11-06 19:59:00', status: 11 }]); f.mode('no-class');
+  assert.equal((await f.request('/api/admin/reconcile-attendance')).status, 401);
+  const result = await f.request('/api/admin/reconcile-attendance', {}, true);
+  assert.equal(result.status, 200); assert.equal(result.body.verified, 1);
+  assert.equal(f.sqlite.prepare("SELECT outcome FROM events WHERE kind='attendance'").get().outcome, 'verified');
+  assert.equal((await f.request('/api/admin/reconcile-attendance', {}, true)).body.checked, 0);
+  assert.equal(f.submissions(), 1);
+});
+test('persistent verification wake respects processing leases, completion, and disabling the service', async t => {
+  const f = fixture(t); Object.assign(f.env, { AUTO_SIGN: 'true', SIGNING_PROTOCOL: 'plugin', ENABLE_ATTENDANCE_MONITOR: 'true' });
+  f.mode('timeout'); await f.app.monitor(f.env);
+  assert.equal(await nextVerificationWake(f.env, f.now()), f.now() + 60000);
+  f.sqlite.prepare("UPDATE events SET status='processing',claimed_at=? WHERE kind='attendance'").run(f.now());
+  assert.equal(await nextVerificationWake(f.env, f.now()), f.now() + 120001);
+  f.sqlite.exec("UPDATE events SET status='done',outcome='verified' WHERE kind='attendance'");
+  assert.equal(await nextVerificationWake(f.env, f.now()), null);
+  f.env.ENABLED = 'false'; assert.equal(await nextVerificationWake(f.env, f.now()), null);
+});
+test('an automatic sign inside a durable alarm replans after monitor returns without calling its own queued plan', { timeout: 1000 }, async t => {
+  const f = fixture(t); Object.assign(f.env, { AUTO_SIGN: 'true', SIGNING_PROTOCOL: 'plugin', ENABLE_ATTENDANCE_MONITOR: 'true' });
+  let alarm = null, nestedPlans = 0;
+  const storage = { getAlarm: async () => alarm, setAlarm: async value => { alarm = value; }, deleteAlarm: async () => { alarm = null; } };
+  const scheduler = createClassScheduler({ env: f.env, storage, monitor: f.app.monitor, now: f.now });
+  f.env.CLASS_SCHEDULER = { getByName: () => ({ fetch: async () => { nestedPlans++; return Response.json(await scheduler.plan()); } }) };
+  f.mode('timeout'); await scheduler.alarm();
+  assert.equal(nestedPlans, 0); assert.equal(f.submissions(), 1);
+  assert.equal(alarm, f.now() + 60000);
+});
+test('concurrent reconciliation claims one due read and sends one corrected result', async t => {
+  const f = fixture(t); Object.assign(f.env, { AUTO_SIGN: 'true', SIGNING_PROTOCOL: 'plugin', ENABLE_ATTENDANCE_MONITOR: 'true' });
+  f.mode('timeout'); await f.app.monitor(f.env); f.advance(60000);
+  f.mode('no-class'); f.records([{ attendanceId: '30', status: 11 }]);
+  await Promise.all([f.request('/api/admin/reconcile-attendance', {}, true), f.request('/api/admin/reconcile-attendance', {}, true)]);
+  assert.equal(f.sqlite.prepare('SELECT attempts FROM attendance_verifications').get().attempts, 2);
+  assert.equal(f.pushes.filter(push => push.title.includes('后台已核实')).length, 1);
+  assert.equal(f.submissions(), 1);
+});
+test('an old event cannot borrow the start of a different current activity, and an expired check stops', async t => {
+  const f = fixture(t); Object.assign(f.env, { AUTO_SIGN: 'true', SIGNING_PROTOCOL: 'plugin', ENABLE_ATTENDANCE_MONITOR: 'true' });
+  f.mode('timeout'); await f.app.monitor(f.env); f.sqlite.exec('DELETE FROM attendance_verifications');
+  f.mode('new-round'); f.records([{ time: '2026-11-06 19:59:00', status: 11 }]);
+  const r = await f.request('/api/admin/reconcile-attendance', {}, true);
+  assert.equal(r.body.verified, 0);
+  assert.equal(f.sqlite.prepare('SELECT started_at FROM attendance_verifications').get().started_at, null);
+  f.advance(11 * 60000); f.mode('no-class'); await f.app.monitor(f.env, { scheduled: true });
+  assert.equal(f.sqlite.prepare('SELECT state FROM attendance_verifications').get().state, 'unresolved');
+  assert.equal(await nextVerificationWake(f.env, f.now()), null);
+  assert.equal(f.sqlite.prepare("SELECT outcome FROM events WHERE kind='attendance'").get().outcome, 'unknown');
+  assert.equal(f.submissions(), 1);
 });
 test('automatic mode cannot submit when submission is disabled and uncertain writes are never repeated', async t => {
   const f = fixture(t); Object.assign(f.env, { AUTO_SIGN: 'true', SIGNING_PROTOCOL: 'plugin', ENABLE_ATTENDANCE_MONITOR: 'true', ENABLE_SIGNING: 'false' });
