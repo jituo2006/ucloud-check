@@ -57,7 +57,7 @@ export function createAttendanceVerifier({ readIdentity, readRecords, readBasic,
     const verified = record && [11, 12, 13].includes(Number(record.status));
     const state = verified ? 'verified' : current.attempts + 1 >= LIMIT ? 'unresolved' : 'pending';
     const recordTime = record && Number.isFinite(serverTime(record.time)) ? record.time.slice(0, 60) : null;
-    const save = env.DB.prepare(`UPDATE attendance_verifications SET started_at=?,state=?,next_at=?,record_status=?,record_time=? WHERE event_id=?`)
+    const save = env.DB.prepare(`UPDATE attendance_verifications SET started_at=COALESCE(started_at,?),state=?,next_at=?,record_status=?,record_time=? WHERE event_id=?`)
       .bind(startedAt, state, state === 'pending' ? now() + INTERVAL : null,
         record && Number.isSafeInteger(Number(record.status)) ? Number(record.status) : null, recordTime, event.id);
     if (verified) {

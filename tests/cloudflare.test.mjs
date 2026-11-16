@@ -24,6 +24,7 @@ function fixture(t) {
   let time = Date.parse('2026-11-06T12:00:00Z');
   let mode = 'normal';
   let recordRows = null;
+  let basicHook = null;
   DB.batch = async statements => {
     sqlite.exec('BEGIN');
     try { const results = []; for (const statement of statements) results.push(await statement.run()); sqlite.exec('COMMIT'); return results; }
@@ -88,10 +89,10 @@ function fixture(t) {
     if (path === '/ykt-basics/info') data = { id: mode === 'other-account' ? '8' : '9' };
     else if (path === '/ykt-site/site/list/student/current') data = { records: [{ id: '10', siteName: '模拟云端课堂' }] };
     else if (path === '/blade-chat/web/chat/myCourse') data = mode === 'no-class' ? [] : [{ siteId: '10', groupId: '20' }];
-    else if (path === '/ykt-site/attendancebasicinfo/basic') data = { attendanceBasicInfo: {
+    else if (path === '/ykt-site/attendancebasicinfo/basic') { if (basicHook) basicHook(); data = { attendanceBasicInfo: {
       id: mode === 'new-round' ? '31' : '30', siteId: '10', attendanceBasicStatus: 1,
       attendanceStartTime: new Date(time - 60000).toISOString(), attendanceEndTime: new Date(time + 120000).toISOString(),
-    }, person: { signed: mode === 'signed' ? 1 : 0 } };
+    }, person: { signed: mode === 'signed' ? 1 : 0 } }; }
     else if (path === '/ykt-site/common/v2/clock') data = { data: 'offline-clock' };
     else if (path === '/ykt-site/attendancedetailinfo/getUserAttendListBySiteIdAndUserId') {
       assert.equal(JSON.parse(options.body).userId, '9');
@@ -119,6 +120,7 @@ function fixture(t) {
   return { app, env, ctx, calls, pushes, request, sqlite, casPasswords, now: () => time,
     mode: value => { mode = value; }, advance: value => { time += value; },
     records: value => { recordRows = value; },
+    onBasic: value => { basicHook = value; },
     drain: async () => { while (tasks.length) await Promise.all(tasks.splice(0)); },
     token: () => new URL(pushes.find(push => push.url).url).hash.slice(1),
     submissions: () => calls.filter(path => path.endsWith('/attendancedetailinfo/sign')).length,
@@ -586,6 +588,20 @@ test('an old event cannot borrow the start of a different current activity, and 
   assert.equal(f.sqlite.prepare('SELECT state FROM attendance_verifications').get().state, 'unresolved');
   assert.equal(await nextVerificationWake(f.env, f.now()), null);
   assert.equal(f.sqlite.prepare("SELECT outcome FROM events WHERE kind='attendance'").get().outcome, 'unknown');
+  assert.equal(f.submissions(), 1);
+});
+test('a concurrent legacy metadata backfill is not overwritten by an older in-flight verification', async t => {
+  const f = fixture(t); Object.assign(f.env, { AUTO_SIGN: 'true', SIGNING_PROTOCOL: 'plugin', ENABLE_ATTENDANCE_MONITOR: 'true' });
+  f.mode('timeout'); await f.app.monitor(f.env); f.sqlite.exec('DELETE FROM attendance_verifications');
+  f.mode('new-round'); f.records([{ time: '2026-11-06 19:59:00', status: 11 }]);
+  const start = f.now() - 60000;
+  f.onBasic(() => f.sqlite.prepare('UPDATE attendance_verifications SET started_at=?').run(start));
+  const result = await f.request('/api/admin/reconcile-attendance', {}, true);
+  assert.equal(result.body.verified, 0);
+  assert.equal(f.sqlite.prepare('SELECT started_at FROM attendance_verifications').get().started_at, start);
+  f.onBasic(null); f.advance(60000); f.mode('no-class');
+  await f.app.monitor(f.env, { scheduled: true });
+  assert.equal(f.sqlite.prepare("SELECT outcome FROM events WHERE kind='attendance'").get().outcome, 'verified');
   assert.equal(f.submissions(), 1);
 });
 test('automatic mode cannot submit when submission is disabled and uncertain writes are never repeated', async t => {
